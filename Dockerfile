@@ -7,8 +7,6 @@ ffmpeg
 ca-certificates 
 && rm -rf /var/lib/apt/lists/*
 
-Install latest yt-dlp
-
 RUN pip3 install --break-system-packages --no-cache-dir --upgrade "yt-dlp[default]"
 
 WORKDIR /app
