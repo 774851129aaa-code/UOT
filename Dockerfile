@@ -4,6 +4,8 @@ RUN apt-get update && apt-get install -y python3 python3-pip ffmpeg ca-certifica
 
 RUN pip3 install --break-system-packages --no-cache-dir --upgrade "yt-dlp[default]"
 
+RUN pip3 install --break-system-packages --no-cache-dir "curl_cffi==0.16.0"
+
 WORKDIR /app
 
 COPY package*.json ./
