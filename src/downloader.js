@@ -62,14 +62,55 @@ function validateUrl(raw) {
     return url.toString();
 }
 
+// تحديد المنصة
+function getPlatform(rawUrl) {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+
+    if (
+        hostname === "tiktok.com" ||
+        hostname.endsWith(".tiktok.com")
+    ) {
+        return "tiktok";
+    }
+
+    if (
+        hostname === "snapchat.com" ||
+        hostname.endsWith(".snapchat.com")
+    ) {
+        return "snapchat";
+    }
+
+    if (
+        hostname === "instagram.com" ||
+        hostname.endsWith(".instagram.com")
+    ) {
+        return "instagram";
+    }
+
+    if (
+        hostname === "pinterest.com" ||
+        hostname.endsWith(".pinterest.com") ||
+        hostname === "pin.it"
+    ) {
+        return "pinterest";
+    }
+
+    return "other";
+}
+
+// تنفيذ yt-dlp
 function runYtDlp(args, timeout = 600000) {
     return new Promise((resolve, reject) => {
-        const child = spawn("yt-dlp", args);
+        const child = spawn("yt-dlp", args, {
+            stdio: ["ignore", "pipe", "pipe"]
+        });
 
         let stdout = "";
         let stderr = "";
+        let timedOut = false;
 
         const timer = setTimeout(() => {
+            timedOut = true;
             child.kill("SIGKILL");
         }, timeout);
 
@@ -79,6 +120,10 @@ function runYtDlp(args, timeout = 600000) {
 
         child.stderr.on("data", data => {
             stderr += data.toString();
+
+            if (stderr.length > 15000) {
+                stderr = stderr.slice(-15000);
+            }
         });
 
         child.on("error", error => {
@@ -89,9 +134,17 @@ function runYtDlp(args, timeout = 600000) {
         child.on("close", code => {
             clearTimeout(timer);
 
+            if (timedOut) {
+                return reject(
+                    new Error("انتهت مهلة تحميل الفيديو")
+                );
+            }
+
             if (code !== 0) {
                 return reject(
-                    new Error(stderr.slice(-1000) || "فشل التحميل")
+                    new Error(
+                        stderr.slice(-3000) || "فشل التحميل"
+                    )
                 );
             }
 
@@ -100,8 +153,54 @@ function runYtDlp(args, timeout = 600000) {
     });
 }
 
+// إعادة المحاولة
+async function runWithRetry(args, timeout, attempts = 2) {
+    let lastError;
+
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            return await runYtDlp(args, timeout);
+        } catch (error) {
+            lastError = error;
+
+            if (i < attempts) {
+                await new Promise(resolve =>
+                    setTimeout(resolve, 2000)
+                );
+            }
+        }
+    }
+
+    throw lastError;
+}
+
+// إعدادات خاصة بكل منصة
+function getPlatformOptions(platform) {
+    const args = [
+        "--no-playlist",
+        "--no-warnings",
+        "--socket-timeout",
+        "30",
+        "--retries",
+        "2",
+        "--fragment-retries",
+        "2"
+    ];
+
+    if (platform === "tiktok") {
+        args.push(
+            "--impersonate",
+            "chrome-146"
+        );
+    }
+
+    return args;
+}
+
+// تحميل الفيديو
 async function downloadVideo(rawUrl) {
     const url = validateUrl(rawUrl);
+    const platform = getPlatform(url);
 
     const dir = fs.mkdtempSync(
         path.join(os.tmpdir(), "telegram-video-")
@@ -110,46 +209,81 @@ async function downloadVideo(rawUrl) {
     const output = path.join(dir, "video.%(ext)s");
 
     try {
-        const metadata = await runYtDlp([
-            "--no-playlist",
+        const commonOptions = getPlatformOptions(platform);
+
+        // استخراج معلومات الفيديو
+        const metadataArgs = [
+            ...commonOptions,
             "--dump-single-json",
-            "--no-warnings",
             url
-        ], 120000);
+        ];
+
+        const metadata = await runWithRetry(
+            metadataArgs,
+            120000,
+            2
+        );
 
         const info = JSON.parse(metadata);
 
         if (
-            info.duration &&
+            typeof info.duration === "number" &&
             info.duration > maxVideoSeconds
         ) {
             throw new Error("الفيديو طويل جدًا");
         }
 
-        await runYtDlp([
-            "--no-playlist",
-            "--no-warnings",
+        // اختيار صيغة الفيديو
+        let format = "bv*+ba/b";
+
+        if (platform === "snapchat") {
+            format = "best[ext=mp4]/best";
+        }
+
+        // تنزيل الفيديو
+        const downloadArgs = [
+            ...commonOptions,
+
             "--max-filesize",
             `${Math.floor(maxVideoBytes / 1024 / 1024)}M`,
+
             "-f",
-            "bv*+ba/b",
+            format,
+
             "--merge-output-format",
             "mp4",
+
             "-o",
             output,
-            url
-        ]);
 
+            url
+        ];
+
+        await runWithRetry(
+            downloadArgs,
+            600000,
+            2
+        );
+
+        // البحث عن الملف
         const files = fs.readdirSync(dir)
-            .filter(file => file.startsWith("video."));
+            .filter(file =>
+                file.startsWith("video.") &&
+                !file.endsWith(".part") &&
+                !file.endsWith(".ytdl")
+            );
 
         if (!files.length) {
-            throw new Error("لم يتم العثور على الفيديو");
+            throw new Error("لم يتم العثور على الفيديو بعد التحميل");
         }
 
         const filePath = path.join(dir, files[0]);
 
         const stat = fs.statSync(filePath);
+
+        if (!stat.isFile() || stat.size === 0) {
+            throw new Error("ملف الفيديو فارغ أو غير صالح");
+        }
 
         if (stat.size > maxVideoBytes) {
             throw new Error("حجم الفيديو أكبر من المسموح");
@@ -158,8 +292,12 @@ async function downloadVideo(rawUrl) {
         return {
             filePath,
             dir,
+
             title: info.title || "Telegram Video",
-            description: "Uploaded via Telegram Bot"
+
+            description:
+                info.description ||
+                "Uploaded via Telegram Bot"
         };
 
     } catch (error) {
@@ -168,7 +306,14 @@ async function downloadVideo(rawUrl) {
             force: true
         });
 
-        throw error;
+        console.error(
+            `[Downloader:${platform}]`,
+            error.message
+        );
+
+        throw new Error(
+            `فشل تحميل فيديو ${platform}: ${error.message.slice(0, 700)}`
+        );
     }
 }
 
